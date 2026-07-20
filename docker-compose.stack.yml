@@ -1,0 +1,97 @@
+# Self-contained variant for stack editors (Portainer / Coolify / Dokploy)
+# where there is no filesystem to mount a config file from.
+#
+# The delimiter is QUOTED — <<'EOF', not <<EOF. That makes the heredoc fully
+# literal: sh performs no variable expansion and no backslash processing, so
+# the TOML lands byte-for-byte as written. The earlier `invalid escape
+# character in string` came from an unquoted heredoc, where `\$` was consumed
+# as an escape and the stray backslash leaked into the TOML.
+#
+# Consequence of going literal: credentials cannot be injected via ${VAR} here.
+# They are inline below, exactly as in the original stack. ROTATE THEM — the
+# previous pair was pasted into a chat transcript.
+
+services:
+  greptimedb:
+    # Pinned, not `latest`: the config schema shifts between releases and a
+    # silent image bump is how a working config starts failing to parse.
+    image: 'greptime/greptimedb:v0.15.2'
+    container_name: greptimedb-r2
+    entrypoint:
+      - /bin/sh
+      - '-c'
+    command:
+      - |
+        set -e
+        mkdir -p /data/hot /data/metadata
+        cat <<'EOF' > /tmp/greptime-config.toml
+        [storage]
+        type = "S3"
+        bucket = "ohlcv"
+        root = "/data"
+        endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
+        region = "auto"
+        access_key_id = ${R2_ACCESS_KEY_ID}
+        secret_access_key = ${R2_SECRET_ACCESS_KEY}
+
+        # Metadata, WAL and cache live on the mounted volume, not the object store.
+        data_home = "/data/metadata"
+
+        # Local-disk provider for the hot daily-rollup table. Raw minute ticks
+        # stay in R2 (cheap, cold); ohlcv_daily is small and read on every chart
+        # request, so it is pinned to local disk via
+        #   CREATE TABLE ... WITH (storage = 'local_hot')
+        # If this build rejects the block, delete it — the rollup table still
+        # lands in the large write cache below and stays fast.
+        [[storage.providers]]
+        name = "local_hot"
+        type = "File"
+        root = "/data/hot"
+
+        [wal]
+        provider = "raft_engine"
+        sync_write = false
+
+        [[region_engine]]
+        [region_engine.mito]
+        num_workers = 8
+        max_background_jobs = 8
+
+        # Unified local read+write cache. The single biggest latency lever:
+        # anything not resident here costs an HTTPS round trip to R2. Size it to
+        # hold the whole compressed dataset — oversizing costs nothing.
+        write_cache_size = "300GiB"
+        write_cache_ttl = "0s"
+        enable_refill_cache_on_read = true
+
+        # In-memory caches — avoid re-decoding parquet pages on repeat reads.
+        page_cache_size = "8GiB"
+        vector_cache_size = "1GiB"
+        sst_meta_cache_size = "512MiB"
+        selector_result_cache_size = "1GiB"
+
+        global_write_buffer_size = "2GiB"
+        global_write_buffer_reject_size = "4GiB"
+
+        [region_engine.mito.index]
+        metadata_cache_size = "1GiB"
+        content_cache_size = "4GiB"
+        EOF
+
+        exec greptime standalone start -c /tmp/greptime-config.toml \
+          --http-addr 0.0.0.0:4000 \
+          --rpc-addr 0.0.0.0:4001 \
+          --mysql-addr 0.0.0.0:4002 \
+          --postgres-addr 0.0.0.0:4003 \
+          --user-provider=static_user_provider:cmd:admin=${GREPTIME_ADMIN_PW}
+    ports:
+      - '4000:4000'
+      - '4001:4001'
+      - '4002:4002'
+      - '4003:4003'
+    volumes:
+      - 'greptime-data:/data'
+    restart: unless-stopped
+
+volumes:
+  greptime-data:
